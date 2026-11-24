@@ -52,6 +52,16 @@ defmodule MemBot do
   @callback handle_request(user :: user(), action :: String.t(), data :: term()) ::
               {:reply, map()} | {:reply, :data, term()} | :noreply
 
+  @doc """
+  The same with the request's id (32 hex digits) as the second argument, for a service that
+  needs it: to recognise a request the phone sent again, or to answer it later with
+  `answer/5`. When a handler defines this one, it is called instead of `c:handle_request/3`.
+  """
+  @callback handle_request(user :: user(), id :: String.t(), action :: String.t(), data :: term()) ::
+              {:reply, map()} | {:reply, :data, term()} | :noreply
+
+  @optional_callbacks handle_request: 3, handle_request: 4
+
   @retry_ms 1_000
   @max_retry_ms 30_000
 
@@ -92,6 +102,18 @@ defmodule MemBot do
     end
   end
 
+  @doc """
+  Answers the request `id` of `user` later, after the handler returned `:noreply`: the answer
+  goes to the Mini App as the reply to that request. Returns like `push/4`.
+  """
+  @spec answer(GenServer.server(), user(), String.t(), term(), kind()) :: :ok | {:error, term()}
+  def answer(server \\ __MODULE__, user, id, body, kind \\ :state)
+      when is_binary(id) and kind in [:state, :data] do
+    with :ok <- check_body(kind, body) do
+      GenServer.call(server, {:update, user, id, kind, body})
+    end
+  end
+
   @doc "The service's pairing card (`memcard0:` text), once the node has sent it."
   @spec card(GenServer.server()) :: String.t() | nil
   def card(server \\ __MODULE__), do: GenServer.call(server, :card)
@@ -107,6 +129,10 @@ defmodule MemBot do
       token: Keyword.fetch!(opts, :token),
       handler: Keyword.fetch!(opts, :handler)
     }
+
+    # Which handle_request/3,4 it defines is asked per request: load it first (in interactive
+    # mode a module is loaded only when first called).
+    {:module, _} = Code.ensure_loaded(state.handler)
 
     send(self(), :connect)
     {:ok, state}
@@ -219,7 +245,9 @@ defmodule MemBot do
        }) do
     answer =
       try do
-        state.handler.handle_request(user, action, data)
+        if function_exported?(state.handler, :handle_request, 4),
+          do: state.handler.handle_request(user, id, action, data),
+          else: state.handler.handle_request(user, action, data)
       rescue
         e ->
           Logger.error("MemBot: handler failed on #{inspect(action)}: " <> Exception.message(e))

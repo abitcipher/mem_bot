@@ -60,6 +60,19 @@ defmodule MemBotTest do
     def handle_request(_user, _action, _data), do: :noreply
   end
 
+  defmodule IdHandler do
+    @moduledoc false
+    @behaviour MemBot
+
+    @impl true
+    def handle_request(user, id, "later", _data) do
+      send(:persistent_term.get(:mem_bot_test), {:later, user, id})
+      :noreply
+    end
+
+    def handle_request(_user, id, _action, _data), do: {:reply, %{"id" => id}}
+  end
+
   setup do
     :persistent_term.put(:mem_bot_test, self())
 
@@ -75,14 +88,14 @@ defmodule MemBotTest do
     %{url: "ws://127.0.0.1:#{port}/"}
   end
 
-  defp start(url, token \\ @token) do
+  defp start(url, token \\ @token, handler \\ Handler) do
     name = :"bot_#{System.unique_integer([:positive])}"
-    start_supervised!({MemBot, url: url, token: token, handler: Handler, name: name})
+    start_supervised!({MemBot, url: url, token: token, handler: handler, name: name})
     name
   end
 
-  defp linked(url) do
-    bot = start(url)
+  defp linked(url, handler \\ Handler) do
+    bot = start(url, @token, handler)
     assert_receive {:node, node}
     wait_until(fn -> MemBot.card(bot) == "memcard0:TEST" end)
     {bot, node}
@@ -129,6 +142,26 @@ defmodule MemBotTest do
            } = update
 
     assert is_integer(ref)
+  end
+
+  test "a handler with the request's id gets it, and may answer later", %{url: url} do
+    {bot, node} = linked(url, IdHandler)
+    send(node, {:send, %{type: "request", user: @user, id: @id, action: "ask", data: %{}}})
+    assert_receive {:from_service, %{"in_reply_to" => @id, "body" => %{"id" => @id}}}
+
+    later = String.duplicate("b", 32)
+    send(node, {:send, %{type: "request", user: @user, id: later, action: "later", data: %{}}})
+    assert_receive {:later, @user, ^later}
+    refute_receive {:from_service, _}, 100
+
+    task = Task.async(fn -> MemBot.answer(bot, @user, later, %{"done" => true}) end)
+
+    assert_receive {:from_service,
+                    %{"in_reply_to" => ^later, "ref" => ref, "body" => %{"done" => true}}}
+
+    send(node, {:send, %{type: "ok", ref: ref}})
+    assert Task.await(task) == :ok
+    assert MemBot.answer(bot, @user, later, %{"t" => 1.5}) == {:error, :float}
   end
 
   test "a data answer is sent as data", %{url: url} do
