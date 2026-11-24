@@ -202,6 +202,44 @@ defmodule MemBotTest do
     refute_receive {:from_service, _}, 100
   end
 
+  test "a hello sent in the same packet as the upgrade's answer is not lost" do
+    # A node that writes the 101 answer and its first frame at once, as mem-botd may.
+    {:ok, listen} =
+      :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
+
+    {:ok, port} = :inet.port(listen)
+
+    spawn_link(fn ->
+      {:ok, socket} = :gen_tcp.accept(listen)
+      {:ok, request} = recv_headers(socket, "")
+      [_, key] = Regex.run(~r/sec-websocket-key: *(\S+)/i, request)
+
+      accept =
+        :crypto.hash(:sha, key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11") |> Base.encode64()
+
+      hello = Jason.encode!(%{type: "hello", card: "memcard0:EARLY"})
+
+      :ok =
+        :gen_tcp.send(socket, [
+          "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n",
+          "sec-websocket-accept: #{accept}\r\n\r\n",
+          <<0x81, byte_size(hello)>>,
+          hello
+        ])
+
+      Process.sleep(:infinity)
+    end)
+
+    bot = start("ws://127.0.0.1:#{port}/")
+    wait_until(fn -> MemBot.card(bot) == "memcard0:EARLY" end)
+  end
+
+  defp recv_headers(socket, acc) do
+    {:ok, data} = :gen_tcp.recv(socket, 0, 2_000)
+    acc = acc <> data
+    if String.contains?(acc, "\r\n\r\n"), do: {:ok, acc}, else: recv_headers(socket, acc)
+  end
+
   test "a wrong token never links", %{url: url} do
     bot = start(url, "wrong")
     assert_receive :unauthorized

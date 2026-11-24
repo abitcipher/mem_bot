@@ -75,6 +75,8 @@ defmodule MemBot do
     :status,
     :resp_headers,
     card: nil,
+    # Bytes that came with the upgrade's answer, before the WebSocket existed.
+    pending: "",
     next_ref: 1,
     waiting: %{},
     retry_ms: @retry_ms
@@ -189,10 +191,17 @@ defmodule MemBot do
   defp handle_response(%{ref: ref} = state, {:headers, ref, headers}),
     do: {:ok, %{state | resp_headers: headers}}
 
+  # The node sends `hello` at once: it may arrive in the same packet as the upgrade's answer,
+  # and Mint hands it over before `:done`. Keep it until the WebSocket exists.
+  defp handle_response(%{ref: ref, websocket: nil} = state, {:data, ref, data}),
+    do: {:ok, %{state | pending: state.pending <> data}}
+
   defp handle_response(%{ref: ref, websocket: nil} = state, {:done, ref}) do
     case Mint.WebSocket.new(state.conn, ref, state.status, state.resp_headers) do
       {:ok, conn, websocket} ->
-        {:ok, %{state | conn: conn, websocket: websocket, retry_ms: @retry_ms}}
+        early = state.pending
+        state = %{state | conn: conn, websocket: websocket, retry_ms: @retry_ms, pending: ""}
+        if early == "", do: {:ok, state}, else: handle_response(state, {:data, ref, early})
 
       # 401: wrong token; 409: another service is connected.
       {:error, conn, reason} ->
@@ -336,6 +345,7 @@ defmodule MemBot do
          websocket: nil,
          status: nil,
          resp_headers: nil,
+         pending: "",
          waiting: %{},
          retry_ms: min(state.retry_ms * 2, @max_retry_ms)
      }}
